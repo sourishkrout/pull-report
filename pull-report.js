@@ -12,6 +12,7 @@ var fs = require("fs"),
   handlebars = require("handlebars"),
   program = require("commander"),
   iniparser = require("iniparser"),
+  moment = require("moment"),
   GitHubApi = require("github"),
 
   HOME_PATH = process.env.HOME,
@@ -40,7 +41,9 @@ function getPrs(opts, callback) {
     repos: function (cb) {
       github.repos.getFromOrg({
         org: opts.org,
-        per_page: 100
+        per_page: 100,
+        type: 'member'
+        //per_page: 5
       }, cb);
     },
 
@@ -55,10 +58,23 @@ function getPrs(opts, callback) {
           user: opts.org,
           repo: repo.name,
           state: opts.state,
-          per_page: 100
+          per_page: 1000
+          //per_page: 5
         }, function (err, prs) {
           if (prs && prs.length) {
             delete prs.meta;
+            _.each(prs, function(pr, i) {
+              if (pr.state === "closed") {
+                var createdAt = moment(pr.created_at);
+                var closedAt = moment(pr.closed_at);
+                var turnaround = closedAt.diff(createdAt, 'seconds');
+                pr.lifecycle = {
+                  createdAt: createdAt,
+                  closedAt: closedAt,
+                  turnaround: turnaround
+                };
+              }
+            });
             repos[repo.name].prs = prs;
           }
 
@@ -112,8 +128,11 @@ function getPrs(opts, callback) {
               user: pr.user ? pr.user.login : null,
               assignee: pr.assignee ? pr.assignee.login : null,
               number: pr.number,
-              title: pr.title,
-              url: program.prUrl || program.html ? url : null
+              title: pr.title.replace(/,/g, ""),
+              url: program.prUrl || program.html ? url : null,
+              createdAt: pr.lifecycle.createdAt.format("YYYY/MM/DD HH:mm:ss"),
+              closedAt: pr.lifecycle.closedAt.format("YYYY/MM/DD HH:mm:ss"),
+              turnaround: pr.lifecycle.turnaround
             };
           })
           .filter(function (pr) {
@@ -160,8 +179,8 @@ if (require.main === module) {
     .option("-i, --insecure", "Allow unauthorized TLS (for proxies)", false)
     .option("-t, --tmpl <path>", "Handlebars template path")
     .option("--html", "Display report as HTML", false)
-    .option("--gh-user <username>", "GitHub user name", ghConfig.user || null)
-    .option("--gh-pass <password>", "GitHub pass", ghConfig.password || null)
+    //.option("--gh-user <username>", "GitHub user name", ghConfig.user || null)
+    //.option("--gh-pass <password>", "GitHub pass", ghConfig.password || null)
     .option("--pr-url", "Add pull request URL to output", false)
     .parse(process.argv);
 
@@ -170,10 +189,6 @@ if (require.main === module) {
   // --------------------------------------------------------------------------
   if (!program.org) {
     throw new Error("Must specify 1+ organization names");
-  }
-  if (!(program.ghUser && program.ghPass)) {
-    throw new Error("Must specify GitHub user / pass in .gitconfig or " +
-      "on the command line");
   }
   if (["open", "closed"].indexOf(program.state) < 0) {
     throw new Error("Invalid issues state: " + program.state);
@@ -230,9 +245,8 @@ if (require.main === module) {
 
   // Authenticate.
   github.authenticate({
-    type: "basic",
-    username: program.ghUser,
-    password: program.ghPass,
+    type: "oauth",
+    token: process.env.GITHUB_OAUTH_ACCESS_TOKEN
   });
 
   // --------------------------------------------------------------------------
@@ -244,6 +258,21 @@ if (require.main === module) {
   // Set display function.
   // --------------------------------------------------------------------------
   var display = function (results) {
+    var prs = [];
+    _.each(results, function(org) {
+      _.each(org.repos, function(repo) {
+        _.each(repo.prs, function(pr) {
+          prs.push(pr);
+        });
+      });
+    });
+    var total = _.chain(prs).filter(function(pr) {
+      return typeof pr.turnaround === 'number';
+    }).pluck("turnaround").reduce(function(a, b) {
+      return a + b;
+    }).value();
+    results.total = total;
+    results.avg = total/prs.length;
     write(tmpl(results));
   };
 
@@ -259,6 +288,8 @@ if (require.main === module) {
     }, cb);
   }, function (err, results) {
     if (err) { throw err; }
+    var total = 0;
+    results.total = 0;
     display(results);
   });
 }
